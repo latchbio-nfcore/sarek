@@ -1,29 +1,61 @@
+import os
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from enum import Enum
-import os
-import subprocess
-import requests
-import shutil
 from pathlib import Path
-import typing
-import typing_extensions
+from typing import Annotated, List, Optional
 
-from latch.resources.workflow import workflow
-from latch.resources.tasks import nextflow_runtime_task, custom_task
-from latch.types.file import LatchFile
-from latch.types.directory import LatchDir, LatchOutputDir
-from latch.ldata.path import LPath
-from latch_cli.nextflow.workflow import get_flag
-from latch_cli.nextflow.utils import _get_execution_name
-from latch_cli.utils import urljoins
-from latch.types import metadata
+import requests
 from flytekit.core.annotation import FlyteAnnotation
-
+from latch.executions import rename_current_execution, report_nextflow_used_storage
+from latch.ldata.path import LPath
+from latch.resources.tasks import custom_task, nextflow_runtime_task
+from latch.resources.workflow import workflow
+from latch.types import metadata
+from latch.types.directory import LatchDir, LatchOutputDir
+from latch.types.file import LatchFile
+from latch_cli.nextflow.utils import _get_execution_name
+from latch_cli.nextflow.workflow import get_flag
 from latch_cli.services.register.utils import import_module_by_path
+from latch_cli.utils import urljoins
 
 meta = Path("latch_metadata") / "__init__.py"
 import_module_by_path(meta)
 import latch_metadata
+
+sys.stdout.reconfigure(line_buffering=True)
+
+
+@dataclass(frozen=True)
+class Sample:
+    patient: str
+    lane: int
+    status: int
+    sample: str
+    sex: str
+    fastq_1: LatchFile
+    fastq_2: LatchFile
+
+
+class ReferenceType(Enum):
+    homo_sapiens = "Homo sapiens (RefSeq GRCh38.p14)"
+    mus_musculus = "Mus musculus (RefSeq GRCm39)"
+    rattus_norvegicus = "Rattus norvegicus (RefSeq GRCr8)"
+    # drosophila_melanogaster = "Drosophila melanogaster (RefSeq Release_6_plus_ISO1_MT)"
+    # rhesus_macaque = "Macaca mulatta (RefSeq rheMac10/Mmul_10)"
+    # saccharomyces_cerevisiae = "Saccharomyces cerevisiae (RefSeq R64)"
+
+
+class StepOptions(Enum):
+    mapping = "mapping"
+    markduplicates = "markduplicates"
+    prepare_recalibration = "prepare_recalibration"
+    recalibrate = "recalibrate"
+    variant_calling = "variant_calling"
+    annotate = "annotate"
+
 
 @custom_task(cpu=0.25, memory=0.5, storage_gib=1)
 def initialize() -> str:
@@ -37,7 +69,10 @@ def initialize() -> str:
     resp = requests.post(
         "http://nf-dispatcher-service.flyte.svc.cluster.local/provision-storage",
         headers=headers,
-        json={},
+        json={
+            "storage_expiration_hours": 0,
+            "version": 2,
+        },
     )
     resp.raise_for_status()
     print("Done.")
@@ -45,118 +80,172 @@ def initialize() -> str:
     return resp.json()["name"]
 
 
-@dataclass
-class Sample:
-    patient: str
-    lane: int
-    status: int
-    sample: str
-    sex: str
-    fastq_1: LatchFile
-    fastq_2: LatchFile
+@nextflow_runtime_task(cpu=4, memory=8, storage_gib=100)
+def nextflow_runtime(
+    pvc_name: str,
+    run_name: str,
+    input: List[Sample],
+    genome_source: str,
+    latch_genome: ReferenceType,
+    outdir: LatchOutputDir,
+    wes: bool,
+    intervals: Optional[LatchFile],
+    no_intervals: bool,
+    tools: Optional[str],
+    skip_tools: Optional[str],
+    trim_fastq: bool,
+    umi_read_structure: Optional[str],
+    save_mapped: bool,
+    save_output_as_bam: bool,
+    use_gatk_spark: Optional[str],
+    concatenate_vcfs: bool,
+    only_paired_variant_calling: bool,
+    joint_germline: bool,
+    joint_mutect2: bool,
+    bcftools_annotations: Optional[LatchFile],
+    bcftools_annotations_tbi: Optional[LatchFile],
+    bcftools_header_lines: Optional[LatchFile],
+    dbsnp_vqsr: Optional[str],
+    fasta: Optional[LatchFile],
+    fasta_fai: Optional[str],
+    known_indels_vqsr: Optional[str],
+    known_snps: Optional[LatchFile],
+    known_snps_tbi: Optional[LatchFile],
+    known_snps_vqsr: Optional[str],
+    ngscheckmate_bed: Optional[LatchFile],
+    snpeff_db: Optional[str],
+    snpeff_genome: Optional[str],
+    vep_genome: Optional[str],
+    vep_species: Optional[str],
+    vep_cache_version: Optional[str],
+    save_reference: bool,
+    build_only_index: bool,
+    download_cache: bool,
+    igenomes_base: Optional[LatchDir],
+    igenomes_ignore: bool,
+    vep_cache: Optional[LatchDir],
+    snpeff_cache: Optional[LatchDir],
+    email: Optional[str],
+    multiqc_title: Optional[str],
+    multiqc_methods_description: Optional[str],
+    step: StepOptions,
+    split_fastq: Optional[int],
+    nucleotides_per_second: Optional[int],
+    aligner: Optional[str],
+    vep_custom_args: Optional[str],
+    vep_version: Optional[str],
+    genome: Optional[str],
+) -> None:
+    shared_dir = Path("/nf-workdir")
+    rename_current_execution(str(run_name))
 
+    ignore_list = [
+        "latch",
+        ".latch",
+        ".git",
+        "nextflow",
+        ".nextflow",
+        "work",
+        "results",
+        "miniconda",
+        "anaconda3",
+        "mambaforge",
+    ]
 
+    shutil.copytree(
+        Path("/root"),
+        shared_dir,
+        ignore=lambda src, names: ignore_list,
+        ignore_dangling_symlinks=True,
+        dirs_exist_ok=True,
+    )
 
+    profile_list = ["docker", "test"]
 
-input_construct_samplesheet = metadata._nextflow_metadata.parameters['input'].samplesheet_constructor
+    if len(profile_list) == 0:
+        profile_list.append("standard")
 
+    profiles = ",".join(profile_list)
 
-@nextflow_runtime_task(cpu=4, memory=8, storage_gib=500)
-def nextflow_runtime(pvc_name: str, input: typing.List[Sample], outdir: typing_extensions.Annotated[LatchDir, FlyteAnnotation({'output': True})], intervals: typing.Optional[str], no_intervals: typing.Optional[bool], skip_tools: typing.Optional[str], trim_fastq: typing.Optional[bool], umi_read_structure: typing.Optional[str], save_mapped: typing.Optional[bool], save_output_as_bam: bool, use_gatk_spark: typing.Optional[str], concatenate_vcfs: typing.Optional[bool], only_paired_variant_calling: typing.Optional[bool], joint_germline: typing.Optional[bool], joint_mutect2: typing.Optional[bool], bcftools_annotations: typing.Optional[str], bcftools_annotations_tbi: typing.Optional[str], bcftools_header_lines: typing.Optional[str], dbsnp_vqsr: typing.Optional[str], fasta: typing.Optional[LatchFile], fasta_fai: typing.Optional[str], known_indels_vqsr: typing.Optional[str], known_snps: typing.Optional[str], known_snps_tbi: typing.Optional[str], known_snps_vqsr: typing.Optional[str], ngscheckmate_bed: typing.Optional[str], snpeff_db: typing.Optional[str], snpeff_genome: typing.Optional[str], vep_genome: typing.Optional[str], vep_species: typing.Optional[str], vep_cache_version: typing.Optional[str], save_reference: typing.Optional[bool], build_only_index: typing.Optional[bool], download_cache: typing.Optional[bool], igenomes_base: typing.Optional[LatchDir], igenomes_ignore: typing.Optional[bool], vep_cache: typing.Optional[LatchDir], snpeff_cache: typing.Optional[LatchDir], email: typing.Optional[str], multiqc_title: typing.Optional[str], multiqc_methods_description: typing.Optional[str], step: str, split_fastq: typing.Optional[int], wes: bool, nucleotides_per_second: typing.Optional[int], tools: str, aligner: typing.Optional[str], vep_custom_args: typing.Optional[str], vep_version: typing.Optional[str], genome: typing.Optional[str]) -> None:
+    cmd = [
+        "/root/nextflow",
+        "run",
+        str(shared_dir / "main.nf"),
+        "-work-dir",
+        str(shared_dir),
+        "-profile",
+        profiles,
+        "-c",
+        "latch.config",
+        "-resume",
+        *get_flag("input", input),
+        *get_flag("step", step),
+        *get_flag("outdir", LatchOutputDir(f"{outdir.remote_path}/{run_name}")),
+        *get_flag("split_fastq", split_fastq),
+        *get_flag("wes", wes),
+        *get_flag("intervals", intervals),
+        *get_flag("nucleotides_per_second", nucleotides_per_second),
+        *get_flag("no_intervals", no_intervals),
+        *get_flag("tools", tools),
+        *get_flag("skip_tools", skip_tools),
+        *get_flag("trim_fastq", trim_fastq),
+        *get_flag("umi_read_structure", umi_read_structure),
+        *get_flag("aligner", aligner),
+        *get_flag("save_mapped", save_mapped),
+        *get_flag("save_output_as_bam", save_output_as_bam),
+        *get_flag("use_gatk_spark", use_gatk_spark),
+        *get_flag("concatenate_vcfs", concatenate_vcfs),
+        *get_flag("only_paired_variant_calling", only_paired_variant_calling),
+        *get_flag("joint_germline", joint_germline),
+        *get_flag("joint_mutect2", joint_mutect2),
+        *get_flag("vep_custom_args", vep_custom_args),
+        *get_flag("vep_version", vep_version),
+        *get_flag("bcftools_annotations", bcftools_annotations),
+        *get_flag("bcftools_annotations_tbi", bcftools_annotations_tbi),
+        *get_flag("bcftools_header_lines", bcftools_header_lines),
+        *get_flag("genome", genome),
+        *get_flag("fasta", fasta),
+        *get_flag("fasta_fai", fasta_fai),
+        *get_flag("dbsnp_vqsr", dbsnp_vqsr),
+        *get_flag("known_indels_vqsr", known_indels_vqsr),
+        *get_flag("known_snps", known_snps),
+        *get_flag("known_snps_tbi", known_snps_tbi),
+        *get_flag("known_snps_vqsr", known_snps_vqsr),
+        *get_flag("ngscheckmate_bed", ngscheckmate_bed),
+        *get_flag("snpeff_db", snpeff_db),
+        *get_flag("snpeff_genome", snpeff_genome),
+        *get_flag("vep_genome", vep_genome),
+        *get_flag("vep_species", vep_species),
+        *get_flag("vep_cache_version", vep_cache_version),
+        *get_flag("save_reference", save_reference),
+        *get_flag("build_only_index", build_only_index),
+        *get_flag("download_cache", download_cache),
+        *get_flag("igenomes_base", igenomes_base),
+        *get_flag("igenomes_ignore", igenomes_ignore),
+        *get_flag("vep_cache", vep_cache),
+        *get_flag("snpeff_cache", snpeff_cache),
+        *get_flag("email", email),
+        *get_flag("multiqc_title", multiqc_title),
+        *get_flag("multiqc_methods_description", multiqc_methods_description),
+    ]
+
+    if genome_source == "latch_genome_source":
+        cmd += [
+            "--fasta",
+            f"s3://latch-public/nf-core/rnaseq/{latch_genome.name}/{latch_genome.name}.genomic.fna",
+            "--fasta_fai",
+            f"s3://latch-public/nf-core/rnaseq/{latch_genome.name}/{latch_genome.name}.genomic.fna.fai",
+        ]
+
+    print("Launching Nextflow Runtime")
+    print(" ".join(cmd))
+    print(flush=True)
+
+    failed = False
     try:
-        shared_dir = Path("/nf-workdir")
-
-        input_samplesheet = input_construct_samplesheet(input)
-
-        ignore_list = [
-            "latch",
-            ".latch",
-            ".git",
-            "nextflow",
-            ".nextflow",
-            "work",
-            "results",
-            "miniconda",
-            "anaconda3",
-            "mambaforge",
-        ]
-
-        shutil.copytree(
-            Path("/root"),
-            shared_dir,
-            ignore=lambda src, names: ignore_list,
-            ignore_dangling_symlinks=True,
-            dirs_exist_ok=True,
-        )
-
-        cmd = [
-            "/root/nextflow",
-            "run",
-            str(shared_dir / "main.nf"),
-            "-work-dir",
-            str(shared_dir),
-            "-profile",
-            "standard",
-            "-c",
-            "latch.config",
-            "-resume",
-        *get_flag('input', input_samplesheet),
-                *get_flag('step', step),
-                *get_flag('outdir', outdir),
-                *get_flag('split_fastq', split_fastq),
-                *get_flag('wes', wes),
-                *get_flag('intervals', intervals),
-                *get_flag('nucleotides_per_second', nucleotides_per_second),
-                *get_flag('no_intervals', no_intervals),
-                *get_flag('tools', tools),
-                *get_flag('skip_tools', skip_tools),
-                *get_flag('trim_fastq', trim_fastq),
-                *get_flag('umi_read_structure', umi_read_structure),
-                *get_flag('aligner', aligner),
-                *get_flag('save_mapped', save_mapped),
-                *get_flag('save_output_as_bam', save_output_as_bam),
-                *get_flag('use_gatk_spark', use_gatk_spark),
-                *get_flag('concatenate_vcfs', concatenate_vcfs),
-                *get_flag('only_paired_variant_calling', only_paired_variant_calling),
-                *get_flag('joint_germline', joint_germline),
-                *get_flag('joint_mutect2', joint_mutect2),
-                *get_flag('vep_custom_args', vep_custom_args),
-                *get_flag('vep_version', vep_version),
-                *get_flag('bcftools_annotations', bcftools_annotations),
-                *get_flag('bcftools_annotations_tbi', bcftools_annotations_tbi),
-                *get_flag('bcftools_header_lines', bcftools_header_lines),
-                *get_flag('genome', genome),
-                *get_flag('dbsnp_vqsr', dbsnp_vqsr),
-                *get_flag('fasta', fasta),
-                *get_flag('fasta_fai', fasta_fai),
-                *get_flag('known_indels_vqsr', known_indels_vqsr),
-                *get_flag('known_snps', known_snps),
-                *get_flag('known_snps_tbi', known_snps_tbi),
-                *get_flag('known_snps_vqsr', known_snps_vqsr),
-                *get_flag('ngscheckmate_bed', ngscheckmate_bed),
-                *get_flag('snpeff_db', snpeff_db),
-                *get_flag('snpeff_genome', snpeff_genome),
-                *get_flag('vep_genome', vep_genome),
-                *get_flag('vep_species', vep_species),
-                *get_flag('vep_cache_version', vep_cache_version),
-                *get_flag('save_reference', save_reference),
-                *get_flag('build_only_index', build_only_index),
-                *get_flag('download_cache', download_cache),
-                *get_flag('igenomes_base', igenomes_base),
-                *get_flag('igenomes_ignore', igenomes_ignore),
-                *get_flag('vep_cache', vep_cache),
-                *get_flag('snpeff_cache', snpeff_cache),
-                *get_flag('email', email),
-                *get_flag('multiqc_title', multiqc_title),
-                *get_flag('multiqc_methods_description', multiqc_methods_description)
-        ]
-
-        print("Launching Nextflow Runtime")
-        print(' '.join(cmd))
-        print(flush=True)
-
         env = {
             **os.environ,
+            "NXF_ANSI_LOG": "false",
             "NXF_HOME": "/root/.nextflow",
             "NXF_OPTS": "-Xms1536M -Xmx6144M -XX:ActiveProcessorCount=4",
             "NXF_DISABLE_CHECK_LATEST": "true",
@@ -168,6 +257,8 @@ def nextflow_runtime(pvc_name: str, input: typing.List[Sample], outdir: typing_e
             check=True,
             cwd=str(shared_dir),
         )
+    except subprocess.CalledProcessError:
+        failed = True
     finally:
         print()
 
@@ -177,14 +268,90 @@ def nextflow_runtime(pvc_name: str, input: typing.List[Sample], outdir: typing_e
             if name is None:
                 print("Skipping logs upload, failed to get execution name")
             else:
-                remote = LPath(urljoins("latch:///nextflow_sarek_logs/nf_nf_core_sarek", name, "nextflow.log"))
+                remote = LPath(urljoins("latch:///your_log_dir/nf_nf_core_sarek", name, "nextflow.log"))
                 print(f"Uploading .nextflow.log to {remote.path}")
                 remote.upload_from(nextflow_log)
 
+        print("Computing size of workdir... ", end="")
+        try:
+            result = subprocess.run(
+                ["du", "-sb", str(shared_dir)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5 * 60,
+            )
+
+            size = int(result.stdout.split()[0])
+            report_nextflow_used_storage(size)
+            print(f"Done. Workdir size: {size / 1024 / 1024 / 1024: .2f} GiB")
+        except subprocess.TimeoutExpired:
+            print("Failed to compute storage size: Operation timed out after 5 minutes.")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to compute storage size: {e.stderr}")
+        except Exception as e:
+            print(f"Failed to compute storage size: {e}")
+
+    if failed:
+        sys.exit(1)
 
 
 @workflow(metadata._nextflow_metadata)
-def nf_nf_core_sarek(input: typing.List[Sample], outdir: typing_extensions.Annotated[LatchDir, FlyteAnnotation({'output': True})], intervals: typing.Optional[str], no_intervals: typing.Optional[bool], skip_tools: typing.Optional[str], trim_fastq: typing.Optional[bool], umi_read_structure: typing.Optional[str], save_mapped: typing.Optional[bool], save_output_as_bam: bool, use_gatk_spark: typing.Optional[str], concatenate_vcfs: typing.Optional[bool], only_paired_variant_calling: typing.Optional[bool], joint_germline: typing.Optional[bool], joint_mutect2: typing.Optional[bool], bcftools_annotations: typing.Optional[str], bcftools_annotations_tbi: typing.Optional[str], bcftools_header_lines: typing.Optional[str], dbsnp_vqsr: typing.Optional[str], fasta: typing.Optional[LatchFile], fasta_fai: typing.Optional[str], known_indels_vqsr: typing.Optional[str], known_snps: typing.Optional[str], known_snps_tbi: typing.Optional[str], known_snps_vqsr: typing.Optional[str], ngscheckmate_bed: typing.Optional[str], snpeff_db: typing.Optional[str], snpeff_genome: typing.Optional[str], vep_genome: typing.Optional[str], vep_species: typing.Optional[str], vep_cache_version: typing.Optional[str], save_reference: typing.Optional[bool], build_only_index: typing.Optional[bool], download_cache: typing.Optional[bool], igenomes_base: typing.Optional[LatchDir], igenomes_ignore: typing.Optional[bool], vep_cache: typing.Optional[LatchDir], snpeff_cache: typing.Optional[LatchDir], email: typing.Optional[str], multiqc_title: typing.Optional[str], multiqc_methods_description: typing.Optional[str], step: str = 'mapping', split_fastq: typing.Optional[int] = 50000000, wes: bool = True, nucleotides_per_second: typing.Optional[int] = 200000, tools: str = 'mutect2,strelka,snpeff,vep,merge', aligner: typing.Optional[str] = 'bwa-mem', vep_custom_args: typing.Optional[str] = '--everything --filter_common --per_gene --total_length --offline --format vcf', vep_version: typing.Optional[str] = '111.0-0', genome: typing.Optional[str] = 'GATK.GRCh38') -> None:
+def nf_nf_core_sarek(
+    run_name: str,
+    input: List[Sample],
+    genome_source: str,
+    outdir: LatchOutputDir,
+    wes: bool,
+    intervals: Optional[LatchFile],
+    no_intervals: bool,
+    tools: Optional[str],
+    skip_tools: Optional[str],
+    trim_fastq: bool,
+    umi_read_structure: Optional[str],
+    save_mapped: bool,
+    save_output_as_bam: bool,
+    use_gatk_spark: Optional[str],
+    concatenate_vcfs: bool,
+    only_paired_variant_calling: bool,
+    joint_germline: bool,
+    joint_mutect2: bool,
+    bcftools_annotations: Optional[LatchFile],
+    bcftools_annotations_tbi: Optional[LatchFile],
+    bcftools_header_lines: Optional[LatchFile],
+    dbsnp_vqsr: Optional[str],
+    fasta: Optional[LatchFile],
+    fasta_fai: Optional[str],
+    known_indels_vqsr: Optional[str],
+    known_snps: Optional[LatchFile],
+    known_snps_tbi: Optional[LatchFile],
+    known_snps_vqsr: Optional[str],
+    ngscheckmate_bed: Optional[LatchFile],
+    snpeff_db: Optional[str],
+    snpeff_genome: Optional[str],
+    vep_genome: Optional[str],
+    vep_species: Optional[str],
+    vep_cache_version: Optional[str],
+    save_reference: bool,
+    build_only_index: bool,
+    download_cache: bool,
+    igenomes_base: Optional[LatchDir],
+    igenomes_ignore: bool,
+    vep_cache: Optional[LatchDir],
+    snpeff_cache: Optional[LatchDir],
+    email: Optional[str],
+    multiqc_title: Optional[str],
+    multiqc_methods_description: Optional[str],
+    latch_genome: ReferenceType = ReferenceType.homo_sapiens,
+    step: StepOptions = StepOptions.mapping,
+    split_fastq: Optional[int] = 50000000,
+    nucleotides_per_second: Optional[int] = 200000,
+    aligner: Optional[str] = "bwa-mem",
+    vep_custom_args: Optional[str] = "--everything --filter_common --per_gene --total_length --offline --format vcf",
+    vep_version: Optional[str] = "111.0-0",
+    genome: Optional[str] = "GATK.GRCh38",
+) -> None:
     """
     nf-core/sarek
 
@@ -192,5 +359,58 @@ def nf_nf_core_sarek(input: typing.List[Sample], outdir: typing_extensions.Annot
     """
 
     pvc_name: str = initialize()
-    nextflow_runtime(pvc_name=pvc_name, input=input, step=step, outdir=outdir, split_fastq=split_fastq, wes=wes, intervals=intervals, nucleotides_per_second=nucleotides_per_second, no_intervals=no_intervals, tools=tools, skip_tools=skip_tools, trim_fastq=trim_fastq, umi_read_structure=umi_read_structure, aligner=aligner, save_mapped=save_mapped, save_output_as_bam=save_output_as_bam, use_gatk_spark=use_gatk_spark, concatenate_vcfs=concatenate_vcfs, only_paired_variant_calling=only_paired_variant_calling, joint_germline=joint_germline, joint_mutect2=joint_mutect2, vep_custom_args=vep_custom_args, vep_version=vep_version, bcftools_annotations=bcftools_annotations, bcftools_annotations_tbi=bcftools_annotations_tbi, bcftools_header_lines=bcftools_header_lines, genome=genome, dbsnp_vqsr=dbsnp_vqsr, fasta=fasta, fasta_fai=fasta_fai, known_indels_vqsr=known_indels_vqsr, known_snps=known_snps, known_snps_tbi=known_snps_tbi, known_snps_vqsr=known_snps_vqsr, ngscheckmate_bed=ngscheckmate_bed, snpeff_db=snpeff_db, snpeff_genome=snpeff_genome, vep_genome=vep_genome, vep_species=vep_species, vep_cache_version=vep_cache_version, save_reference=save_reference, build_only_index=build_only_index, download_cache=download_cache, igenomes_base=igenomes_base, igenomes_ignore=igenomes_ignore, vep_cache=vep_cache, snpeff_cache=snpeff_cache, email=email, multiqc_title=multiqc_title, multiqc_methods_description=multiqc_methods_description)
-
+    nextflow_runtime(
+        run_name=run_name,
+        pvc_name=pvc_name,
+        input=input,
+        step=step,
+        genome_source=genome_source,
+        latch_genome=latch_genome,
+        outdir=outdir,
+        split_fastq=split_fastq,
+        wes=wes,
+        intervals=intervals,
+        nucleotides_per_second=nucleotides_per_second,
+        no_intervals=no_intervals,
+        tools=tools,
+        skip_tools=skip_tools,
+        trim_fastq=trim_fastq,
+        umi_read_structure=umi_read_structure,
+        aligner=aligner,
+        save_mapped=save_mapped,
+        save_output_as_bam=save_output_as_bam,
+        use_gatk_spark=use_gatk_spark,
+        concatenate_vcfs=concatenate_vcfs,
+        only_paired_variant_calling=only_paired_variant_calling,
+        joint_germline=joint_germline,
+        joint_mutect2=joint_mutect2,
+        vep_custom_args=vep_custom_args,
+        vep_version=vep_version,
+        bcftools_annotations=bcftools_annotations,
+        bcftools_annotations_tbi=bcftools_annotations_tbi,
+        bcftools_header_lines=bcftools_header_lines,
+        genome=genome,
+        dbsnp_vqsr=dbsnp_vqsr,
+        fasta=fasta,
+        fasta_fai=fasta_fai,
+        known_indels_vqsr=known_indels_vqsr,
+        known_snps=known_snps,
+        known_snps_tbi=known_snps_tbi,
+        known_snps_vqsr=known_snps_vqsr,
+        ngscheckmate_bed=ngscheckmate_bed,
+        snpeff_db=snpeff_db,
+        snpeff_genome=snpeff_genome,
+        vep_genome=vep_genome,
+        vep_species=vep_species,
+        vep_cache_version=vep_cache_version,
+        save_reference=save_reference,
+        build_only_index=build_only_index,
+        download_cache=download_cache,
+        igenomes_base=igenomes_base,
+        igenomes_ignore=igenomes_ignore,
+        vep_cache=vep_cache,
+        snpeff_cache=snpeff_cache,
+        email=email,
+        multiqc_title=multiqc_title,
+        multiqc_methods_description=multiqc_methods_description,
+    )
