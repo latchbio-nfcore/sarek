@@ -12,3 +12,4 @@ testing*
 test-datasets/
 test.tap
 test.xml
+.latch/.logs

@@ -19,21 +19,62 @@ from latch.types.metadata import (
 @dataclass(frozen=True)
 class Sample:
     patient: str
-    lane: int
-    status: int
+    sex: Optional[str]
+    status: Optional[int]
     sample: str
-    sex: str
-    fastq_1: LatchFile
-    fastq_2: LatchFile
+    lane: Optional[int]
+    fastq_1: Optional[LatchFile]
+    fastq_2: Optional[LatchFile]
+    bam: Optional[LatchFile]
+    bai: Optional[LatchFile]
+    cram: Optional[LatchFile]
+    crai: Optional[LatchFile]
+    table: Optional[LatchFile]
+    vcf: Optional[LatchFile]
 
 
-class ReferenceType(Enum):
-    homo_sapiens = "Homo sapiens (RefSeq GRCh38.p14)"
-    mus_musculus = "Mus musculus (RefSeq GRCm39)"
-    rattus_norvegicus = "Rattus norvegicus (RefSeq GRCr8)"
-    # drosophila_melanogaster = "Drosophila melanogaster (RefSeq Release_6_plus_ISO1_MT)"
-    # rhesus_macaque = "Macaca mulatta (RefSeq rheMac10/Mmul_10)"
-    # saccharomyces_cerevisiae = "Saccharomyces cerevisiae (RefSeq R64)"
+class GenomeReference(Enum):
+    GATK_GRCh37 = "GATK Human Genome GRCh37 (hg19) - Broad Institute"
+    GATK_GRCh38 = "GATK Human Genome GRCh38 (hg38) - Broad Institute"
+    Ensembl_GRCh37 = "Ensembl Human Genome GRCh37 (hg19)"
+    NCBI_GRCh38 = "NCBI Human Genome GRCh38 (hg38)"
+    CHM13 = "UCSC Human Genome CHM13 (T2T Complete)"
+    GRCm38 = "Ensembl Mouse Genome GRCm38 (mm10)"
+    TAIR10 = "Ensembl Arabidopsis thaliana Genome TAIR10"
+    EB2 = "Ensembl Bacillus subtilis Genome EB2"
+    UMD3_1 = "Ensembl Cow Genome UMD3.1"
+    WBcel235 = "Ensembl Worm (C. elegans) Genome WBcel235"
+    CanFam3_1 = "Ensembl Dog Genome CanFam3.1"
+    GRCz10 = "Ensembl Zebrafish Genome GRCz10"
+    BDGP6 = "Ensembl Drosophila Genome BDGP6"
+    EquCab2 = "Ensembl Horse Genome EquCab2"
+    EB1 = "Ensembl Escherichia coli Genome EB1"
+    Galgal4 = "Ensembl Chicken Genome Galgal4"
+    Gm01 = "Ensembl Soybean Genome Gm01"
+    Mmul_1 = "Ensembl Rhesus Macaque Genome Mmul_1"
+    IRGSP_1_0 = "Ensembl Rice Genome IRGSP-1.0"
+    CHIMP2_1_4 = "Ensembl Chimpanzee Genome CHIMP2.1.4"
+    Rnor_5_0 = "Ensembl Rat Genome Rnor_5.0"
+    Rnor_6_0 = "Ensembl Rat Genome Rnor_6.0"
+    R64_1_1 = "Ensembl Yeast Genome R64-1-1"
+    EF2 = "Ensembl Schizosaccharomyces pombe Genome EF2"
+    Sbi1 = "Ensembl Sorghum Genome Sbi1"
+    Sscrofa10_2 = "Ensembl Pig Genome Sscrofa10.2"
+    AGPv3 = "Ensembl Maize Genome AGPv3"
+    hg38 = "UCSC Human Genome hg38"
+    hg19 = "UCSC Human Genome hg19"
+    mm10 = "UCSC Mouse Genome mm10"
+    bosTau8 = "UCSC Cow Genome bosTau8"
+    ce10 = "UCSC Worm (C. elegans) Genome ce10"
+    canFam3 = "UCSC Dog Genome canFam3"
+    danRer10 = "UCSC Zebrafish Genome danRer10"
+    dm6 = "UCSC Drosophila Genome dm6"
+    equCab2 = "UCSC Horse Genome equCab2"
+    galGal4 = "UCSC Chicken Genome galGal4"
+    panTro4 = "UCSC Chimpanzee Genome panTro4"
+    rn6 = "UCSC Rat Genome rn6"
+    sacCer3 = "UCSC Yeast Genome sacCer3"
+    susScr3 = "UCSC Pig Genome susScr3"
 
 
 class StepOptions(Enum):
@@ -43,6 +84,12 @@ class StepOptions(Enum):
     recalibrate = "recalibrate"
     variant_calling = "variant_calling"
     annotate = "annotate"
+
+
+class ReferenceType(Enum):
+    homo_sapiens = "Homo sapiens (RefSeq GRCh38.p14)"
+    mus_musculus = "Mus musculus (RefSeq GRCm39)"
+    rattus_norvegicus = "Rattus norvegicus (RefSeq GRCr8)"
 
 
 flow = [
@@ -58,10 +105,23 @@ flow = [
         Fork(
             "genome_source",
             "",
-            latch_genome_source=ForkBranch(
-                "Latch Verified Reference Genome",
+            # latch_genome_source=ForkBranch(
+            #     "Reference Genome",
+            #     Params(
+            #         "latch_genome",
+            #     ),
+            # ),
+            igenomes_reference=ForkBranch(
+                "iGenomes Reference",
                 Params(
-                    "latch_genome",
+                    "genome",
+                ),
+                Spoiler(
+                    "iGenomes Reference Options",
+                    Params(
+                        "igenomes_base",
+                        "igenomes_ignore",
+                    ),
                 ),
             ),
             custom=ForkBranch(
@@ -70,7 +130,40 @@ flow = [
                     "fasta",
                     "fasta_fai",
                 ),
+                Spoiler(
+                    "Reference Genome Options",
+                    Params(
+                        "dbsnp_vqsr",
+                        "known_indels_vqsr",
+                        "known_snps",
+                        "known_snps_tbi",
+                        "known_snps_vqsr",
+                        "ngscheckmate_bed",
+                        "snpeff_db",
+                        "snpeff_genome",
+                        "vep_genome",
+                        "vep_species",
+                        "vep_cache_version",
+                        "save_reference",
+                        "build_only_index",
+                        "download_cache",
+                        "vep_cache",
+                        "snpeff_cache",
+                    ),
+                ),
             ),
+        ),
+    ),
+    Section(
+        "Run Options",
+        Params(
+            "split_fastq",
+            "wes",
+            "intervals",
+            "nucleotides_per_second",
+            "no_intervals",
+            "tools",
+            "skip_tools",
         ),
     ),
     Section(
@@ -82,26 +175,14 @@ flow = [
     Spoiler(
         "Optional Arguments",
         Text("Additional optional arguments"),
-        Section(
-            "Main Options",
-            Params(
-                "split_fastq",
-                "wes",
-                "intervals",
-                "nucleotides_per_second",
-                "no_intervals",
-                "tools",
-                "skip_tools",
-            ),
-        ),
-        Section(
+        Spoiler(
             "FASTQ Preprocessing",
             Params(
                 "trim_fastq",
                 "umi_read_structure",
             ),
         ),
-        Section(
+        Spoiler(
             "Preprocessing",
             Params(
                 "aligner",
@@ -110,30 +191,7 @@ flow = [
                 "use_gatk_spark",
             ),
         ),
-        Section(
-            "Reference Genome Options",
-            Params(
-                "dbsnp_vqsr",
-                "known_indels_vqsr",
-                "known_snps",
-                "known_snps_tbi",
-                "known_snps_vqsr",
-                "ngscheckmate_bed",
-                "snpeff_db",
-                "snpeff_genome",
-                "vep_genome",
-                "vep_species",
-                "vep_cache_version",
-                "save_reference",
-                "build_only_index",
-                "download_cache",
-                "igenomes_base",
-                "igenomes_ignore",
-                "vep_cache",
-                "snpeff_cache",
-            ),
-        ),
-        Section(
+        Spoiler(
             "Variant Calling",
             Params(
                 "concatenate_vcfs",
@@ -142,7 +200,7 @@ flow = [
                 "joint_mutect2",
             ),
         ),
-        Section(
+        Spoiler(
             "Annotation",
             Params(
                 "vep_custom_args",
@@ -152,7 +210,7 @@ flow = [
                 "bcftools_header_lines",
             ),
         ),
-        Section(
+        Spoiler(
             "Reporting Options",
             Params(
                 "email",
@@ -189,12 +247,12 @@ generated_parameters = {
         display_name="Reference Genome",
         description="Choose Reference Genome",
     ),
-    "latch_genome": NextflowParameter(
-        type=ReferenceType,
-        display_name="Latch Verfied Reference Genome",
-        description="Name of Latch Verfied Reference Genome.",
-        default=ReferenceType.homo_sapiens,
-    ),
+    # "latch_genome": NextflowParameter(
+    #     type=ReferenceType,
+    #     display_name="Latch Verfied Reference Genome",
+    #     description="Name of Latch Verfied Reference Genome.",
+    #     default=ReferenceType.homo_sapiens,
+    # ),
     "outdir": NextflowParameter(
         type=LatchOutputDir,
         display_name="Output Directory",
@@ -336,7 +394,6 @@ generated_parameters = {
     "genome": NextflowParameter(
         type=Optional[str],
         display_name="Reference Genome",
-        default="GATK.GRCh38",
         description="Name of iGenomes reference.",
     ),
     "dbsnp_vqsr": NextflowParameter(
