@@ -120,11 +120,11 @@ def initialize(run_name: str) -> str:
 
     print("Provisioning shared storage volume... ", end="")
     resp = requests.post(
-        # "http://nf-dispatcher-service.flyte.svc.cluster.local/provision-storage-ofs",
-        "http://nf-dispatcher-service.flyte.svc.cluster.local/provision-storage",
+        "http://nf-dispatcher-service.flyte.svc.cluster.local/provision-storage-ofs",
+        # "http://nf-dispatcher-service.flyte.svc.cluster.local/provision-storage",
         headers=headers,
         json={
-            "storage_expiration_hours": 0,
+            "storage_expiration_hours": 120,
             "version": 2,
         },
     )
