@@ -134,7 +134,9 @@ flow = [
                     "Reference Genome Options",
                     Params(
                         "dbsnp_vqsr",
+                        "dbsnp",
                         "known_indels_vqsr",
+                        "known_indels",
                         "known_snps",
                         "known_snps_tbi",
                         "known_snps_vqsr",
@@ -408,6 +410,12 @@ generated_parameters = {
         default=None,
         description="label string for VariantRecalibration (haplotypecaller joint variant calling)",
     ),
+    "dbsnp": NextflowParameter(
+        type=Optional[LatchFile],
+        display_name="Known dbsnp",
+        default=None,
+        description="Path to dbsnp vcf file.",
+    ),
     "fasta": NextflowParameter(
         type=Optional[LatchFile],
         display_name="FASTA Genome File",
@@ -425,6 +433,12 @@ generated_parameters = {
         display_name="Known Indels VQSR",
         default=None,
         description="1st label string for VariantRecalibration (haplotypecaller joint variant calling)",
+    ),
+    "known_indels": NextflowParameter(
+        type=Optional[LatchFile],
+        display_name="Known Indels",
+        default=None,
+        description="Path to indel vcf file.",
     ),
     "known_snps": NextflowParameter(
         type=Optional[LatchFile],
